@@ -1,0 +1,49 @@
+# Archivos de sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archivos de entorno y configuración
+.env
+.env.local
+*.env.local
+*.conf
+!configs/**/*.conf
+
+# Directorios de datos
+data/
+docs/
+logs/
+tmp/
+temp/
+private-llm-data/
+
+# Archivos temporales de instalación
+install.sh.bak
+*.log
+*.tmp
+*.bak
+
+# Archivos de caché de Docker
+.docker/
+
+# Archivos de desarrollo
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archivos de seguridad 
+*.pem
+*.key
+*.crt
+.htpasswd
+
+# Archivos de usuario locales
+user-configs/
+custom-scripts/
+
+# Archivos personales
+TODO.md
+NOTES.md
+PRIVATE*.md
