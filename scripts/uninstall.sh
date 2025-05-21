@@ -13,6 +13,12 @@ IFS=$'\n\t'
 # Variables globales
 LOG_FILE="/tmp/private-llm-uninstaller.log"
 CONFIG_FILE="$HOME/.private-llm-config"
+DATA_DIR=""
+DOMAIN=""
+
+# Variables para opciones de desinstalación
+remove_models="n"
+remove_ollama="n"
 
 # Colores para mensajes
 RED='\033[0;31m'
@@ -80,12 +86,13 @@ confirm_uninstall() {
 # Función para determinar la ubicación de los datos
 get_data_dir() {
   if [ -f "$CONFIG_FILE" ]; then
-    DATA_DIR=$(grep "DATA_DIR" "$CONFIG_FILE" | cut -d'=' -f2)
-  else
-    DATA_DIR="$HOME/private-llm-data"
+    DATA_DIR=$(grep "DATA_DIR" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2 || echo "")
+    DOMAIN=$(grep "DOMAIN" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2 || echo "")
   fi
   
-  DOMAIN=$(grep "DOMAIN" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2 || echo "")
+  if [ -z "$DATA_DIR" ]; then
+    DATA_DIR="$HOME/private-llm-data"
+  fi
   
   log "info" "Directorio de datos: $DATA_DIR"
   if [ -n "$DOMAIN" ]; then
@@ -97,17 +104,31 @@ get_data_dir() {
 remove_containers() {
   log "info" "Deteniendo y eliminando contenedores Docker..."
   
-  if [ -d "$DATA_DIR/open-webui" ]; then
+  # Intentar detener contenedores específicos por nombre
+  local containers_to_stop=("open-webui" "ollama-webui" "private-llm")
+  
+  for container in "${containers_to_stop[@]}"; do
+    if docker ps -q --filter "name=$container" | grep -q .; then
+      log "info" "Deteniendo contenedor: $container"
+      docker stop "$container" >> "$LOG_FILE" 2>&1 || log "warning" "Error al detener $container"
+    fi
+    
+    if docker ps -a -q --filter "name=$container" | grep -q .; then
+      log "info" "Eliminando contenedor: $container"
+      docker rm "$container" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $container"
+    fi
+  done
+  
+  # Si existe el directorio con docker-compose, usarlo
+  if [ -d "$DATA_DIR/open-webui" ] && [ -f "$DATA_DIR/open-webui/docker-compose.yml" ]; then
+    log "info" "Usando docker-compose para detener servicios..."
     (cd "$DATA_DIR/open-webui" && docker compose down -v) >> "$LOG_FILE" 2>&1 || {
-      log "warning" "Error al detener contenedores. Es posible que ya estén detenidos."
+      log "warning" "Error al detener servicios con docker-compose."
     }
-  else
-    log "warning" "Directorio de Open WebUI no encontrado. Intentando detener contenedores manualmente..."
-    docker stop $(docker ps -q --filter "name=open-webui") 2>/dev/null || true
-    docker rm $(docker ps -a -q --filter "name=open-webui") 2>/dev/null || true
   fi
   
-  # Eliminar volúmenes sin usar
+  # Eliminar volúmenes huérfanos
+  log "info" "Limpiando volúmenes Docker huérfanos..."
   docker volume prune -f >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar volúmenes Docker."
   
   log "success" "Contenedores eliminados correctamente."
@@ -118,17 +139,24 @@ remove_nginx_config() {
   if [ -n "$DOMAIN" ]; then
     log "info" "Eliminando configuración de NGINX para $DOMAIN..."
     
-    if [ -f "/etc/nginx/sites-enabled/openwebui" ]; then
-      sudo rm -f "/etc/nginx/sites-enabled/openwebui" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar enlace simbólico de NGINX."
-    fi
+    # Eliminar enlaces simbólicos y archivos de configuración
+    local nginx_configs=("/etc/nginx/sites-enabled/openwebui" "/etc/nginx/sites-enabled/$DOMAIN" "/etc/nginx/sites-available/openwebui" "/etc/nginx/sites-available/$DOMAIN")
     
-    if [ -f "/etc/nginx/sites-available/openwebui" ]; then
-      sudo rm -f "/etc/nginx/sites-available/openwebui" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar configuración de NGINX."
-    fi
+    for config in "${nginx_configs[@]}"; do
+      if [ -f "$config" ]; then
+        log "info" "Eliminando: $config"
+        sudo rm -f "$config" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $config"
+      fi
+    done
     
-    # Recargar NGINX si está en ejecución
-    if systemctl is-active --quiet nginx; then
-      sudo systemctl reload nginx >> "$LOG_FILE" 2>&1 || log "warning" "Error al recargar NGINX."
+    # Verificar configuración de NGINX
+    if sudo nginx -t >> "$LOG_FILE" 2>&1; then
+      # Recargar NGINX si está en ejecución
+      if systemctl is-active --quiet nginx; then
+        sudo systemctl reload nginx >> "$LOG_FILE" 2>&1 || log "warning" "Error al recargar NGINX."
+      fi
+    else
+      log "warning" "Configuración de NGINX inválida después de la eliminación. Verifica manualmente."
     fi
     
     log "success" "Configuración de NGINX eliminada correctamente."
@@ -142,9 +170,20 @@ remove_data_files() {
   if [ -d "$DATA_DIR" ]; then
     log "info" "Eliminando archivos de configuración en $DATA_DIR..."
     
-    # Eliminar todo excepto la carpeta de modelos
+    # Eliminar directorio de Open WebUI
     if [ -d "$DATA_DIR/open-webui" ]; then
       rm -rf "$DATA_DIR/open-webui" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar directorio de Open WebUI."
+    fi
+    
+    # Eliminar otros archivos de configuración pero mantener modelos
+    if [ -d "$DATA_DIR/config" ]; then
+      rm -rf "$DATA_DIR/config" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar directorio de configuración."
+    fi
+    
+    # Si el directorio está vacío (excepto modelos), preguntار si eliminarlo
+    if [ -d "$DATA_DIR" ] && [ "$(find "$DATA_DIR" -type f | wc -l)" -eq 0 ]; then
+      log "info" "El directorio $DATA_DIR está vacío. Eliminándolo..."
+      rmdir "$DATA_DIR" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar directorio vacío."
     fi
     
     log "success" "Archivos de configuración eliminados correctamente."
@@ -161,24 +200,155 @@ remove_ollama_models() {
     if command -v ollama &> /dev/null; then
       # Obtener lista de modelos
       local models
-      models=$(ollama list | awk 'NR>1 {print $1}')
+      models=$(ollama list 2>/dev/null | awk 'NR>1 {print $1}' | head -20) # Limitar para evitar problemas
       
       if [[ -z "$models" ]]; then
         log "info" "No se encontraron modelos instalados."
       else
         for model in $models; do
-          log "info" "Eliminando modelo $model..."
-          ollama rm "$model" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar modelo $model."
+          if [ -n "$model" ] && [ "$model" != "NAME" ]; then
+            log "info" "Eliminando modelo $model..."
+            ollama rm "$model" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar modelo $model."
+          fi
         done
       fi
     else
       log "warning" "Ollama no está instalado. Omitiendo eliminación de modelos."
     fi
     
-    # Limpiar directorio de modelos
-    if [ -d "/root/.ollama" ]; then
-      sudo rm -rf "/root/.ollama/models" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar modelos de Ollama."
+    # Limpiar directorios de modelos
+    local ollama_dirs=("/root/.ollama/models" "$HOME/.ollama/models" "/usr/share/ollama/.ollama/models")
+    
+    for dir in "${ollama_dirs[@]}"; do
+      if [ -d "$dir" ]; then
+        log "info" "Eliminando directorio de modelos: $dir"
+        if [[ "$dir" == "/root/.ollama/models" ]]; then
+          sudo rm -rf "$dir" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $dir"
+        else
+          rm -rf "$dir" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $dir"
+        fi
+      fi
+    done
+    
+    log "success" "Modelos de Ollama eliminados correctamente."
+  else
+    log "info" "Manteniendo modelos de Ollama (no seleccionado para eliminación)."
+  fi
+}
+
+# Función para desinstalar Ollama
+remove_ollama() {
+  if [[ "$remove_ollama" =~ ^[Ss]$ ]]; then
+    log "info" "Desinstalando Ollama..."
+    
+    # Detener servicio de Ollama si existe
+    if systemctl is-active --quiet ollama 2>/dev/null; then
+      log "info" "Deteniendo servicio de Ollama..."
+      sudo systemctl stop ollama >> "$LOG_FILE" 2>&1 || log "warning" "Error al detener servicio de Ollama."
+      sudo systemctl disable ollama >> "$LOG_FILE" 2>&1 || log "warning" "Error al deshabilitar servicio de Ollama."
     fi
     
-    if [ -d "$HOME/.ollama" ]; then
-      rm -rf "$HOME/.ollama/models" >> "$LOG_FILE" 2>&1 || log "warning" "Error
+    # Eliminar binario de Ollama
+    if [ -f "/usr/local/bin/ollama" ]; then
+      log "info" "Eliminando binario de Ollama..."
+      sudo rm -f "/usr/local/bin/ollama" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar binario de Ollama."
+    fi
+    
+    if [ -f "/usr/bin/ollama" ]; then
+      sudo rm -f "/usr/bin/ollama" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar binario de Ollama."
+    fi
+    
+    # Eliminar archivos del sistema
+    local ollama_system_dirs=("/etc/systemd/system/ollama.service" "/usr/share/ollama" "/var/lib/ollama")
+    
+    for dir in "${ollama_system_dirs[@]}"; do
+      if [ -e "$dir" ]; then
+        log "info" "Eliminando: $dir"
+        sudo rm -rf "$dir" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $dir"
+      fi
+    done
+    
+    # Recargar systemd
+    sudo systemctl daemon-reload >> "$LOG_FILE" 2>&1 || log "warning" "Error al recargar systemd."
+    
+    log "success" "Ollama desinstalado correctamente."
+  else
+    log "info" "Manteniendo instalación de Ollama (no seleccionado para desinstalación)."
+  fi
+}
+
+# Función para eliminar archivos de configuración
+remove_config_files() {
+  log "info" "Eliminando archivos de configuración del sistema..."
+  
+  # Eliminar archivo de configuración principal
+  if [ -f "$CONFIG_FILE" ]; then
+    log "info" "Eliminando archivo de configuración: $CONFIG_FILE"
+    rm -f "$CONFIG_FILE" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $CONFIG_FILE"
+  fi
+  
+  # Eliminar otros archivos de configuración relacionados
+  local config_files=("$HOME/.ollama" "$HOME/.private-llm")
+  
+  for config in "${config_files[@]}"; do
+    if [ -d "$config" ] && [[ "$remove_ollama" =~ ^[Ss]$ ]]; then
+      log "info" "Eliminando directorio de configuración: $config"
+      rm -rf "$config" >> "$LOG_FILE" 2>&1 || log "warning" "Error al eliminar $config"
+    fi
+  done
+  
+  log "success" "Archivos de configuración eliminados correctamente."
+}
+
+# Función para mostrar resumen final
+show_summary() {
+  log "success" "🎉 Desinstalación completada exitosamente!"
+  echo ""
+  echo -e "${GREEN}${BOLD}Resumen de la desinstalación:${NC}"
+  echo " ✅ Contenedores Docker eliminados"
+  echo " ✅ Configuración de NGINX eliminada"
+  echo " ✅ Archivos de datos eliminados"
+  
+  if [[ "$remove_models" =~ ^[Ss]$ ]]; then
+    echo " ✅ Modelos de Ollama eliminados"
+  else
+    echo " ⏭️  Modelos de Ollama conservados"
+  fi
+  
+  if [[ "$remove_ollama" =~ ^[Ss]$ ]]; then
+    echo " ✅ Ollama desinstalado"
+  else
+    echo " ⏭️  Ollama conservado"
+  fi
+  
+  echo ""
+  echo -e "${BLUE}Log de desinstalación guardado en: $LOG_FILE${NC}"
+  echo -e "${YELLOW}Si encuentras algún problema, revisa el log para más detalles.${NC}"
+}
+
+# Función principal
+main() {
+  # Inicializar log
+  echo "=== Private LLM Stack Uninstaller - $(date) ===" > "$LOG_FILE"
+  
+  show_banner
+  confirm_uninstall
+  get_data_dir
+  
+  log "info" "Iniciando proceso de desinstalación..."
+  
+  # Ejecutar pasos de desinstalación
+  remove_containers
+  remove_nginx_config
+  remove_data_files
+  remove_ollama_models
+  remove_ollama
+  remove_config_files
+  
+  show_summary
+}
+
+# Verificar si se ejecuta como script principal
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
