@@ -26,6 +26,18 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
+# Variables de configuración
+MODEL=""
+DOMAIN=""
+USERNAME=""
+PASSWORD=""
+PORT="$DEFAULT_PORT"
+NO_SSL=false
+DATA_DIR="$HOME/private-llm-data"
+NO_AUTO_START=false
+GPU_ENABLED=false
+MIN_RAM=2
+
 # Función para mostrar mensaje de bienvenida
 show_banner() {
   clear
@@ -294,8 +306,8 @@ download_ai_model() {
   ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
   local ram_gb=$(( ram_kb / 1024 / 1024 ))
   
-  if [ "$ram_gb" -lt "$MIN_RAM" ]; then
-    log "warning" "⚠️ La RAM disponible (${ram_gb}GB) es menor que la recomendada para $MODEL (${MIN_RAM}GB)."
+  if [ "$ram_gb" -lt "${MIN_RAM:-2}" ]; then
+    log "warning" "⚠️ La RAM disponible (${ram_gb}GB) es menor que la recomendada para $MODEL (${MIN_RAM:-2}GB)."
     log "warning" "El modelo podría funcionar lento o no funcionar correctamente."
     read -rp "¿Deseas continuar de todos modos? (s/N): " continue_ram
     if [[ ! "$continue_ram" =~ ^[Ss]$ ]]; then
@@ -318,28 +330,32 @@ download_ai_model() {
 install_open_webui() {
   log "step" "Instalando Open WebUI..."
   
-  local webui_dir="${DATA_DIR:-$HOME/private-llm-data}/open-webui"
+  local webui_dir="${DATA_DIR}/open-webui"
   mkdir -p "$webui_dir"
   
-  # Clonar repositorio si no existe
-  if [ ! -d "$webui_dir/open-webui" ]; then
-    log "info" "Clonando repositorio Open WebUI..."
-    git clone https://github.com/open-webui/open-webui.git "$webui_dir/open-webui" >> "$LOG_FILE" 2>&1 || {
-      log "error" "Error al clonar repositorio de Open WebUI."
-      exit 1
-    }
-  else
-    log "info" "Actualizando repositorio Open WebUI..."
-    (cd "$webui_dir/open-webui" && git pull) >> "$LOG_FILE" 2>&1
-  fi
-  
-  # Crear archivo .env
-  log "info" "Configurando conexión con Ollama..."
-  echo "OLLAMA_BASE_URL=http://localhost:11434" > "$webui_dir/open-webui/.env"
-  
-  # Crear o actualizar docker-compose
+  # Crear docker-compose.yml
   log "info" "Configurando Docker Compose para Open WebUI..."
-  (cd "$webui_dir/open-webui" && docker compose up -d) >> "$LOG_FILE" 2>&1 || {
+  cat > "$webui_dir/docker-compose.yml" << EOF
+version: '3.8'
+
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "${PORT}:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - ./data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+EOF
+  
+  # Iniciar contenedor
+  log "info" "Iniciando Open WebUI..."
+  (cd "$webui_dir" && docker compose up -d) >> "$LOG_FILE" 2>&1 || {
     log "error" "Error al iniciar Open WebUI con Docker Compose."
     exit 1
   }
@@ -348,7 +364,7 @@ install_open_webui() {
   sleep 5
   if ! docker ps | grep -q open-webui; then
     log "error" "Los contenedores de Open WebUI no están en ejecución."
-    log "error" "Verifica los logs de Docker para más detalles: docker logs open-webui-open-webui-1"
+    log "error" "Verifica los logs de Docker para más detalles: docker logs open-webui"
     exit 1
   fi
   
@@ -359,7 +375,7 @@ install_open_webui() {
   local webui_ready=false
   
   while [ $attempt -le $max_attempts ]; do
-    if curl -s "http://localhost:${PORT:-3000}" -o /dev/null; then
+    if curl -s "http://localhost:${PORT}" -o /dev/null; then
       webui_ready=true
       break
     fi
@@ -369,7 +385,7 @@ install_open_webui() {
   done
   
   if [ "$webui_ready" = true ]; then
-    log "success" "Open WebUI instalado y funcionando correctamente en el puerto ${PORT:-3000}."
+    log "success" "Open WebUI instalado y funcionando correctamente en el puerto ${PORT}."
   else
     log "warning" "Open WebUI parece estar iniciando, pero no responde aún."
     log "warning" "Puedes verificar el estado con: docker ps"
@@ -401,4 +417,282 @@ configure_nginx() {
   fi
   
   # Crear configuración NGINX
-  NGINX_CONF="/
+  local nginx_conf="/etc/nginx/sites-available/${DOMAIN}"
+  
+  # Crear archivo de contraseña
+  log "info" "Creando archivo de autenticación..."
+  echo "$PASSWORD" | sudo htpasswd -ci "/etc/nginx/.htpasswd-${DOMAIN}" "$USERNAME" >> "$LOG_FILE" 2>&1
+  
+  # Configuración básica de NGINX
+  log "info" "Creando configuración de NGINX..."
+  sudo tee "$nginx_conf" > /dev/null << EOF
+server {
+    listen 80;
+    server_name $DOMAIN;
+    
+    auth_basic "Private LLM Access";
+    auth_basic_user_file /etc/nginx/.htpasswd-${DOMAIN};
+    
+    location / {
+        proxy_pass http://localhost:${PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+  
+  # Habilitar el sitio
+  sudo ln -sf "$nginx_conf" "/etc/nginx/sites-enabled/"
+  
+  # Probar configuración
+  sudo nginx -t >> "$LOG_FILE" 2>&1 || {
+    log "error" "Error en la configuración de NGINX."
+    exit 1
+  }
+  
+  # Reiniciar NGINX
+  sudo systemctl restart nginx >> "$LOG_FILE" 2>&1 || {
+    log "error" "Error al reiniciar NGINX."
+    exit 1
+  }
+  
+  log "success" "NGINX configurado correctamente."
+  
+  # Configurar SSL si no está deshabilitado
+  if [ "$NO_SSL" = false ]; then
+    setup_ssl
+  fi
+}
+
+# Función para configurar SSL
+setup_ssl() {
+  log "step" "Configurando SSL con Let's Encrypt..."
+  
+  # Obtener certificado SSL
+  log "info" "Obteniendo certificado SSL para $DOMAIN..."
+  sudo certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --email "admin@${DOMAIN}" >> "$LOG_FILE" 2>&1 || {
+    log "warning" "Error al obtener certificado SSL."
+    log "warning" "El sitio estará disponible solo por HTTP."
+    return 1
+  }
+  
+  log "success" "Certificado SSL configurado correctamente."
+}
+
+# Función para configurar inicio automático
+setup_auto_start() {
+  if [ "$NO_AUTO_START" = true ]; then
+    log "info" "Omitiendo configuración de inicio automático."
+    return 0
+  fi
+  
+  log "step" "Configurando inicio automático del sistema..."
+  
+  # Crear script de inicio
+  local start_script="/usr/local/bin/private-llm-start"
+  sudo tee "$start_script" > /dev/null << EOF
+#!/bin/bash
+cd "${DATA_DIR}/open-webui"
+docker compose up -d
+EOF
+  
+  sudo chmod +x "$start_script"
+  
+  # Crear servicio systemd
+  sudo tee "/etc/systemd/system/private-llm.service" > /dev/null << EOF
+[Unit]
+Description=Private LLM Stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$start_script
+RemainAfterExit=true
+User=$USER
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  
+  sudo systemctl daemon-reload
+  sudo systemctl enable private-llm.service >> "$LOG_FILE" 2>&1
+  
+  log "success" "Inicio automático configurado."
+}
+
+# Función para guardar configuración
+save_config() {
+  log "step" "Guardando configuración..."
+  
+  cat > "$CONFIG_FILE" << EOF
+# Private LLM Stack Configuration
+VERSION=$VERSION
+MODEL=$MODEL
+DOMAIN=$DOMAIN
+USERNAME=$USERNAME
+PORT=$PORT
+DATA_DIR=$DATA_DIR
+SSL_ENABLED=$([ "$NO_SSL" = false ] && echo "true" || echo "false")
+AUTO_START=$([ "$NO_AUTO_START" = false ] && echo "true" || echo "false")
+GPU_ENABLED=$GPU_ENABLED
+INSTALL_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+  
+  log "success" "Configuración guardada en $CONFIG_FILE"
+}
+
+# Función para mostrar resumen final
+show_summary() {
+  log "step" "Instalación completada"
+  
+  echo -e "\n${GREEN}${BOLD}🎉 ¡Instalación completada exitosamente!${NC}"
+  echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}║                    RESUMEN DE INSTALACIÓN                ║${NC}"
+  echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+  
+  echo -e "${YELLOW}📊 Modelo de IA:${NC} $MODEL"
+  echo -e "${YELLOW}🌐 Dominio:${NC} ${DOMAIN:-"localhost:$PORT"}"
+  echo -e "${YELLOW}🔐 Usuario:${NC} ${USERNAME:-"N/A"}"
+  echo -e "${YELLOW}🚀 Puerto:${NC} $PORT"
+  echo -e "${YELLOW}📁 Directorio de datos:${NC} $DATA_DIR"
+  echo -e "${YELLOW}🔒 SSL:${NC} $( [ "$NO_SSL" = false ] && echo "Habilitado" || echo "Deshabilitado" )"
+  
+  echo -e "\n${BLUE}🔗 Acceso:${NC}"
+  if [ -n "${DOMAIN:-}" ]; then
+    if [ "$NO_SSL" = false ]; then
+      echo -e "   https://$DOMAIN"
+    else
+      echo -e "   http://$DOMAIN"
+    fi
+  else
+    echo -e "   http://localhost:$PORT"
+  fi
+  
+  echo -e "\n${BLUE}📋 Comandos útiles:${NC}"
+  echo -e "   Ver logs: docker logs open-webui"
+  echo -e "   Reiniciar: cd $DATA_DIR/open-webui && docker compose restart"
+  echo -e "   Parar: cd $DATA_DIR/open-webui && docker compose down"
+  echo -e "   Actualizar: $0 --update"
+  
+  echo -e "\n${GREEN}¡Disfruta tu asistente de IA privado! 🤖${NC}"
+}
+
+# Función para desinstalar
+uninstall() {
+  log "step" "Desinstalando Private LLM Stack..."
+  
+  # Parar contenedores
+  if [ -d "${DATA_DIR}/open-webui" ]; then
+    (cd "${DATA_DIR}/open-webui" && docker compose down) >> "$LOG_FILE" 2>&1 || true
+  fi
+  
+  # Eliminar contenedores e imágenes
+  docker rm -f open-webui >> "$LOG_FILE" 2>&1 || true
+  docker rmi ghcr.io/open-webui/open-webui:main >> "$LOG_FILE" 2>&1 || true
+  
+  # Eliminar configuración de NGINX
+  if [ -n "${DOMAIN:-}" ] && [ -f "/etc/nginx/sites-available/$DOMAIN" ]; then
+    sudo rm -f "/etc/nginx/sites-available/$DOMAIN"
+    sudo rm -f "/etc/nginx/sites-enabled/$DOMAIN"
+    sudo rm -f "/etc/nginx/.htpasswd-$DOMAIN"
+    sudo systemctl reload nginx >> "$LOG_FILE" 2>&1 || true
+  fi
+  
+  # Eliminar servicio systemd
+  sudo systemctl disable private-llm.service >> "$LOG_FILE" 2>&1 || true
+  sudo rm -f "/etc/systemd/system/private-llm.service"
+  sudo systemctl daemon-reload
+  
+  # Preguntar sobre datos
+  read -rp "¿Eliminar también los datos del modelo y configuración? (s/N): " delete_data
+  if [[ "$delete_data" =~ ^[Ss]$ ]]; then
+    rm -rf "$DATA_DIR"
+    rm -f "$CONFIG_FILE"
+    log "info" "Datos eliminados."
+  fi
+  
+  log "success" "Desinstalación completada."
+}
+
+# Función principal
+main() {
+  # Procesar argumentos
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --model)
+        MODEL="$2"
+        shift 2
+        ;;
+      --domain)
+        DOMAIN="$2"
+        shift 2
+        ;;
+      --username)
+        USERNAME="$2"
+        shift 2
+        ;;
+      --password)
+        PASSWORD="$2"
+        shift 2
+        ;;
+      --port)
+        PORT="$2"
+        shift 2
+        ;;
+      --no-ssl)
+        NO_SSL=true
+        shift
+        ;;
+      --data-dir)
+        DATA_DIR="$2"
+        shift 2
+        ;;
+      --no-auto-start)
+        NO_AUTO_START=true
+        shift
+        ;;
+      --gpu)
+        GPU_ENABLED=true
+        shift
+        ;;
+      --uninstall)
+        uninstall
+        exit 0
+        ;;
+      --version|-v)
+        show_version
+        ;;
+      --help|-h)
+        show_help
+        ;;
+      *)
+        log "error" "Opción desconocida: $1"
+        show_help
+        ;;
+    esac
+  done
+  
+  # Mostrar banner
+  show_banner
+  
+  # Ejecutar instalación
+  check_system_requirements
+  install_dependencies
+  install_ollama
+  download_ai_model
+  install_open_webui
+  configure_nginx
+  setup_auto_start
+  save_config
+  show_summary
+}
+
+# Ejecutar función principal
+main "$@"
