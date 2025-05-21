@@ -1,0 +1,54 @@
+version: '3'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - ./data/ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/version || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: ${OLLAMA_MEMORY_LIMIT:-8G}
+          # Uncomment the next line to enable GPU support
+          # For NVIDIA: runtime: nvidia
+          
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    volumes:
+      - ./data/open-webui:/app/backend/data
+    ports:
+      - "127.0.0.1:${PORT:-3000}:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=basic
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    
+  # Uncomment to enable monitoring (requires more resources)
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: grafana
+  #   volumes:
+  #     - ./data/grafana:/var/lib/grafana
+  #   ports:
+  #     - "127.0.0.1:3100:3000"
+  #   restart: unless-stopped
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+  #     - GF_USERS_ALLOW_SIGN_UP=false
+
+networks:
+  default:
+    name: private-llm-network
