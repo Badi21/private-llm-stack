@@ -421,7 +421,7 @@ configure_nginx() {
   
   # Crear archivo de contraseña
   log "info" "Creando archivo de autenticación..."
-  echo "$PASSWORD" | sudo htpasswd -ci "/etc/nginx/.htpasswd-${DOMAIN}" "$USERNAME" >> "$LOG_FILE" 2>&1
+  echo "$PASSWORD" | sudo htpasswd -ci "/etc/nginx/.htpasswd-${DOMAIN}" "$USERNAME" | sudo tee -a "$LOG_FILE" > /dev/null
   
   # Configuración básica de NGINX
   log "info" "Creando configuración de NGINX..."
@@ -531,7 +531,7 @@ EOF
 save_config() {
   log "step" "Guardando configuración..."
   
-  cat > "$CONFIG_FILE" << EOF
+  sudo tee "$CONFIG_FILE" > /dev/null << EOF
 # Private LLM Stack Configuration
 VERSION=$VERSION
 MODEL=$MODEL
